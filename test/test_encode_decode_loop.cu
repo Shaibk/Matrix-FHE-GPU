@@ -32,14 +32,14 @@ static inline void cuda_sync(const char* msg) {
 // ---------------------------------------------------------
 int main() {
     // 1. 参数设置
-    constexpr int PHI = 16;       // Batch Size (p-1)
-    const int n       = MATRIX_N; // 256
+    constexpr int PHI = BATCH_SIZE;
+    const int n       = MATRIX_N;
     const int n2      = n * n;
     const double DELTA = SCALING_FACTOR / n; // 缩放因子
 
     std::cout << "=== Test: Encode -> PolyMajor Layout -> Decode Loopback ===\n";
     std::cout << "Matrix N: " << n << ", Batch Size: " << PHI << "\n";
-    std::cout << "Target Layout: [Y=" << n << "][Limb=3][X=" << n*16 << "] (Poly-Major)\n";
+    std::cout << "Target Layout: [Y=" << n << "][Limb=" << RNS_NUM_LIMBS << "][X=" << n*PHI << "] (Poly-Major)\n";
 
     // ---------------------------------------------------------
     // 2. 初始化 Host 数据 (生成随机测试数据)
@@ -65,8 +65,8 @@ int main() {
     cuda_check(cudaMemcpy(d_Input, h_Input.data(), PHI * n2 * sizeof(cuDoubleComplex), cudaMemcpyHostToDevice), "H2D Input");
 
     // Poly-Major Layout Buffer (用于存放 Encode 后的结果)
-    // Size = MATRIX_N * Limbs * RLWE_N (RLWE_N = n * PHI)
-    size_t poly_major_size = (size_t)MATRIX_N * RNS_NUM_LIMBS * RLWE_N; 
+    // Size = MATRIX_N * Limbs * PACK_N (PACK_N = n * PHI)
+    size_t poly_major_size = (size_t)MATRIX_N * RNS_NUM_LIMBS * PACK_N; 
     
     uint64_t *d_Packed_Re, *d_Packed_Im;
     cuda_check(cudaMalloc(&d_Packed_Re, poly_major_size * sizeof(uint64_t)), "malloc packed re");
@@ -74,7 +74,7 @@ int main() {
 
     // Eval Domain Buffer (用于 Unpack 还原回来的结果)
     // Size = Batch * Limbs * Space
-    size_t eval_size = (size_t)PHI * RNS_LIMBS * n2;
+    size_t eval_size = (size_t)PHI * RNS_NUM_LIMBS * n2;
     uint64_t *d_Eval_Re, *d_Eval_Im;
     cuda_check(cudaMalloc(&d_Eval_Re, eval_size * sizeof(uint64_t)), "malloc eval re");
     cuda_check(cudaMalloc(&d_Eval_Im, eval_size * sizeof(uint64_t)), "malloc eval im");
@@ -90,7 +90,7 @@ int main() {
 
     std::cout << ">> Step 1: Batched Encode (Input -> PolyMajor)...\n";
     // 这步会调用 SingleEncoder -> pack_w_phi16_kernel (Transpose)
-    batched_enc.encode_packed_p17(d_Input, d_Packed_Re, d_Packed_Im);
+    batched_enc.encode_to_wntt_eval(d_Input, d_Packed_Re, d_Packed_Im);
     cuda_sync("Encode Packed");
 
     std::cout << ">> Step 2: Batched Unpack (PolyMajor -> Eval)...\n";
@@ -105,7 +105,7 @@ int main() {
     size_t blk_words = (size_t)RNS_NUM_LIMBS * n2; // 单个 Batch 的 RNS 大小
 
     for (int l = 0; l < PHI; ++l) {
-        single_enc.decode(
+        single_enc.decode_lane_from_rns_eval(
             d_Eval_Re + l * blk_words,
             d_Eval_Im + l * blk_words,
             d_Output  + l * n2
@@ -134,8 +134,8 @@ int main() {
             double exp_i = h_Input[idx].y;
 
             // Got (需要除以 Scaling Factor)
-            // 注意：SingleEncoder::decode 内部如果没除 Delta，这里需要除
-            // 查看你的 Encoder::decode 实现，通常它最后输出的是带 Scaling 的值
+            // 注意：SingleEncoder::decode_lane_from_rns_eval 内部如果没除 Delta，这里需要除
+            // 查看你的 Encoder::decode_lane_from_rns_eval 实现，通常它最后输出的是带 Scaling 的值
             // 或者它内部已经处理了？
             // 通常 CKKS decode 出来就是原值（如果内部处理了）。
             // 但你的 quantize 用了 SCALING_FACTOR，decode 时如果是 dequantize_exact_kernel 

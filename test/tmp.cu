@@ -30,10 +30,10 @@ static void cuda_sync(const char* msg) {
 // ===================== Main Pipeline Test =====================
 int main() {
     // 1. Configuration from config.h
-    const int n = MATRIX_N;           // 256
-    const int PHI = BATCH_PRIME_P - 1;               // Batch size (p-1)
-    const int N_poly = n * PHI;        // 8192 (Base Ring Degree)
-    const int LIMBS = RNS_NUM_LIMBS;  // 3
+    const int n = MATRIX_N;           
+    const int PHI = BATCH_SIZE;       
+    const int N_poly = n * PHI;       
+    const int LIMBS = RNS_NUM_LIMBS;
     const int n2 = n * n;             // 65536
 
     std::cout << "=== FHE Pipeline Test (Poly-Major Layout) ===\n";
@@ -87,7 +87,7 @@ int main() {
 
     BatchedEncoder batched_enc(n);
     // 此函数内部已包含 Single Encode + Transpose Kernel
-    batched_enc.encode_packed_p17(d_in, d_packed_re, d_packed_im);
+    batched_enc.encode_to_wntt_eval(d_in, d_packed_re, d_packed_im);
     cuda_sync("Batched Encode");
 
     // ---------------------------------------------------------
@@ -101,8 +101,7 @@ int main() {
 
     // encrypt 函数现在能够处理 [Y][Limbs][X] 布局
     // 并且会正确地对 n 个多项式分别调用 Phantom 的 NTT
-    encrypt(d_packed_re, sk, ct_re);
-    encrypt(d_packed_im, sk, ct_im);
+    encrypt_pair(d_packed_re, d_packed_im, sk, ct_re, ct_im);
     cuda_sync("Encrypt");
 
     // ---------------------------------------------------------
@@ -110,55 +109,23 @@ int main() {
     // ---------------------------------------------------------
     std::cout << ">>> Step C: Decrypting...\n";
 
-    uint64_t *d_decrypted_re, *d_decrypted_im;
-    cuda_check(cudaMalloc(&d_decrypted_re, total_poly_coeffs * sizeof(uint64_t)), "Malloc Decrypt Re");
-    cuda_check(cudaMalloc(&d_decrypted_im, total_poly_coeffs * sizeof(uint64_t)), "Malloc Decrypt Im");
+    cuDoubleComplex *d_decrypted;
+    cuda_check(cudaMalloc(&d_decrypted, total_complex_elements * sizeof(cuDoubleComplex)), "Malloc Decrypt");
 
-    decrypt(ct_re, sk, d_decrypted_re);
-    decrypt(ct_im, sk, d_decrypted_im);
+    decrypt_and_decode(ct_re, ct_im, sk, d_decrypted);
     cuda_sync("Decrypt");
 
     // ---------------------------------------------------------
-    // Step D: Decode (Poly-Major Coeffs -> Complex Matrices)
+    // Step D: Combine re/im on host
     // ---------------------------------------------------------
-    std::cout << ">>> Step D: Decode...\n";
-    
-    // 1. Unpack (Poly-Major -> Batch-Major Eval RNS)
-    // d_eval buffer size: PHI * LIMBS * n^2
-    // Note: n^2 (65536) might be larger than RLWE_N (8192), 
-    // but SingleEncoder works on n^2 slots in RNS domain.
-    // unpack_eval_p17 handles the mapping from packed coefficients to RNS slots.
-    size_t rns_eval_size = (size_t)PHI * LIMBS * n2;
-    uint64_t *d_eval_re, *d_eval_im;
-    cuda_check(cudaMalloc(&d_eval_re, rns_eval_size * sizeof(uint64_t)), "Malloc Eval Re");
-    cuda_check(cudaMalloc(&d_eval_im, rns_eval_size * sizeof(uint64_t)), "Malloc Eval Im");
-
-    batched_enc.unpack_eval_p17(d_decrypted_re, d_decrypted_im, d_eval_re, d_eval_im);
-    cuda_sync("Unpack");
-    
-    // 2. Single Decode (RNS Slots -> Complex)
-    cuDoubleComplex* d_out;
-    cuda_check(cudaMalloc(&d_out, total_complex_elements * sizeof(cuDoubleComplex)), "Malloc Out");
-
-    Encoder single_enc(n);
-    size_t batch_rns_stride = (size_t)LIMBS * n2;
-    size_t batch_complex_stride = (size_t)n2;
-    
-    for (int ell = 0; ell < PHI; ++ell) {
-        single_enc.decode(
-            d_eval_re + ell * batch_rns_stride,
-            d_eval_im + ell * batch_rns_stride,
-            d_out + ell * batch_complex_stride
-        );
-    }
-    cuda_sync("Single Decode");
+    std::cout << ">>> Step D: Combine...\n";
 
     // ---------------------------------------------------------
     // Verification
     // ---------------------------------------------------------
     std::cout << ">>> Verifying results...\n";
     std::vector<cuDoubleComplex> h_out(total_complex_elements);
-    cuda_check(cudaMemcpy(h_out.data(), d_out, total_complex_elements * sizeof(cuDoubleComplex), cudaMemcpyDeviceToHost), "D2H Out");
+    cuda_check(cudaMemcpy(h_out.data(), d_decrypted, total_complex_elements * sizeof(cuDoubleComplex), cudaMemcpyDeviceToHost), "D2H Out");
 
     double max_err = 0.0;
     int err_batch = -1;
@@ -171,11 +138,6 @@ int main() {
         
         double ref_r = h_in[i].x;
         double ref_i = h_in[i].y;
-
-        // 注意：Encoder::decode 内部的 dequantize_exact_kernel 通常已经除以了 Delta
-        // 如果误差巨大 (1e12级别)，说明没有除。
-        // 根据之前的代码审查，dequantize_exact_kernel 包含 `return final_val / delta;`
-        // 所以这里直接比较。
 
         double err = std::hypot(got_r - ref_r, got_i - ref_i);
         if (err > max_err) {
@@ -195,10 +157,9 @@ int main() {
     }
 
     // Cleanup
-    cudaFree(d_in); cudaFree(d_out);
+    cudaFree(d_in);
     cudaFree(d_packed_re); cudaFree(d_packed_im);
-    cudaFree(d_decrypted_re); cudaFree(d_decrypted_im);
-    cudaFree(d_eval_re); cudaFree(d_eval_im);
+    cudaFree(d_decrypted);
     free_ciphertext(ct_re);
     free_ciphertext(ct_im);
 

@@ -10,26 +10,26 @@ class BatchedEncoder {
 public:
     explicit BatchedEncoder(int n);
 
-    // Encode 16 matrices (ell=0..15) into one packed polynomial in W (coeff form mod Phi_17).
+    // Encode BATCH_SIZE matrices and output W-NTT evaluation layout (RNS, matrix-major).
     // Input layout:
     //   d_msg_batch[ell*n2 + idx]  (cuDoubleComplex)
-    // Output packed RNS layout (choice (1)):
-    //   d_out_re[(r*3 + limb)*n2 + idx], r=0..15
-    //   d_out_im[(r*3 + limb)*n2 + idx]
-    void encode_packed_p17(
+    // Output layout (W-NTT eval):
+    //   d_out_re[ell*(limbs*n2) + limb*n2 + idx]
+    //   d_out_im[ell*(limbs*n2) + limb*n2 + idx]
+    void encode_to_wntt_eval(
         const cuDoubleComplex* d_msg_batch,
         uint64_t* d_out_re,
         uint64_t* d_out_im,
         cudaStream_t stream = 0
     );
 
-    // Unpack/evaluate packed W-coeff representation back to 16 evaluations (ell=0..15),
+    // Unpack packed W-batched CRT representation back to BATCH_SIZE evaluations,
     // i.e., compute v_ell = sum_r V[ell,r] * c_r (mod q) for each limb and idx.
-    // Input packed layout:
-    //   d_in_re[(r*3 + limb)*n2 + idx]
+    // Input layout:
+    //   d_in_re[ell*(limbs*n2) + limb*n2 + idx]
     // Output eval layout:
-    //   d_eval_re[ell*(3*n2) + limb*n2 + idx]
-    //   d_eval_im[ell*(3*n2) + limb*n2 + idx]
+    //   d_eval_re[ell*(limbs*n2) + limb*n2 + idx]
+    //   d_eval_im[ell*(limbs*n2) + limb*n2 + idx]
     void unpack_eval_p17(
         const uint64_t* d_in_re,
         const uint64_t* d_in_im,
@@ -45,7 +45,7 @@ private:
     int n_;
     int n2_;
 
-    void init_tables_p17(); // builds V and V^{-1} per limb and uploads to device constants
+    void init_tables_p17(); // uploads moduli to device constants
 };
 
 } // namespace matrix_fhe

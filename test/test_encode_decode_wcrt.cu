@@ -1,9 +1,8 @@
-// Encode -> Encrypt -> Decrypt -> Decode loopback test (W-CRT domain)
+// Encode -> Decode loopback test (W-CRT domain)
 
 #include "../include/core/config.h"
 #include "../include/core/encoder.cuh"
 #include "../include/core/batched_encoder.cuh"
-#include "../include/core/HE.cuh"
 
 #include <cuda_runtime.h>
 #include <cuComplex.h>
@@ -32,20 +31,14 @@ int main() {
     const int n2 = n * n;
     const int LIMBS = RNS_NUM_LIMBS;
 
-    std::cout << "=== Test: Encode -> Encrypt -> Decrypt -> Decode (W-CRT) ===\n";
+    std::cout << "=== Test: Encode -> Decode (W-CRT) ===\n";
     std::cout << "n=" << n << ", PHI=" << PHI << ", limbs=" << LIMBS << "\n";
-
-    init_he_backend();
-
-    SecretKey sk;
-    generate_secret_key(sk, LIMBS);
-    cuda_sync("keygen");
 
     // Host input
     std::vector<cuDoubleComplex> h_in((size_t)PHI * (size_t)n2);
     for (int ell = 0; ell < PHI; ++ell) {
         for (int i = 0; i < n2; ++i) {
-            double val = (double)ell + (double)i * 0.001;
+            double val = (double)(ell * 10000 + i);
             h_in[(size_t)ell * (size_t)n2 + (size_t)i] = make_cuDoubleComplex(val, -val);
         }
     }
@@ -67,29 +60,32 @@ int main() {
     batched_enc.encode_to_wntt_eval(d_in, d_packed_re, d_packed_im);
     cuda_sync("encode");
 
-    // Encrypt/Decrypt (re/im separately)
-    RLWECiphertext ct_re, ct_im;
-    allocate_ciphertext(ct_re, LIMBS);
-    allocate_ciphertext(ct_im, LIMBS);
+    // Decode each ell
+    cuDoubleComplex* d_out = nullptr;
+    cuda_check(cudaMalloc(&d_out, h_in.size() * sizeof(cuDoubleComplex)), "malloc out");
 
-    encrypt_pair(d_packed_re, d_packed_im, sk, ct_re, ct_im);
-    cuda_sync("encrypt");
+    Encoder single_enc(n);
+    size_t batch_rns_stride = (size_t)LIMBS * (size_t)n2;
+    size_t batch_complex_stride = (size_t)n2;
 
-    cuDoubleComplex* d_dec_re = nullptr;
-    cuda_check(cudaMalloc(&d_dec_re, h_in.size() * sizeof(cuDoubleComplex)), "malloc dec");
+    for (int ell = 0; ell < PHI; ++ell) {
+        single_enc.decode_lane_from_rns_eval(
+            d_packed_re + (size_t)ell * batch_rns_stride,
+            d_packed_im + (size_t)ell * batch_rns_stride,
+            d_out      + (size_t)ell * batch_complex_stride
+        );
+    }
+    cuda_sync("decode");
 
-    decrypt_and_decode(ct_re, ct_im, sk, d_dec_re);
-    cuda_sync("decrypt");
-
-    // Verify in complex domain against original input
-    std::vector<cuDoubleComplex> h_dec(h_in.size());
-    cuda_check(cudaMemcpy(h_dec.data(), d_dec_re, h_in.size() * sizeof(cuDoubleComplex),
-                          cudaMemcpyDeviceToHost), "D2H dec");
+    // Verify
+    std::vector<cuDoubleComplex> h_out(h_in.size());
+    cuda_check(cudaMemcpy(h_out.data(), d_out, h_out.size() * sizeof(cuDoubleComplex),
+                          cudaMemcpyDeviceToHost), "D2H out");
 
     double max_err = 0.0;
     size_t worst = 0;
     for (size_t i = 0; i < h_in.size(); ++i) {
-        double err = std::hypot(h_dec[i].x - h_in[i].x, h_dec[i].y - h_in[i].y);
+        double err = std::hypot(h_out[i].x - h_in[i].x, h_out[i].y - h_in[i].y);
         if (err > max_err) {
             max_err = err;
             worst = i;
@@ -100,11 +96,9 @@ int main() {
     std::cout << "Worst idx: " << worst << "\n";
 
     cudaFree(d_in);
+    cudaFree(d_out);
     cudaFree(d_packed_re);
     cudaFree(d_packed_im);
-    cudaFree(d_dec_re);
-    free_ciphertext(ct_re);
-    free_ciphertext(ct_im);
 
     return (max_err < 1e-3) ? 0 : 1;
 }

@@ -5,10 +5,8 @@
 
 namespace matrix_fhe {
 
-// compile-time moduli to avoid device indexing into RNS_MODULI[]
-static constexpr uint64_t Q0 = RNS_MODULI[0];
-static constexpr uint64_t Q1 = RNS_MODULI[1];
-static constexpr uint64_t Q2 = RNS_MODULI[2];
+// Use HE moduli from HE.cu constant memory
+extern __constant__ uint64_t d_he_moduli[RNS_NUM_LIMBS];
 
 static __device__ __forceinline__ uint64_t add_mod(uint64_t a, uint64_t b, uint64_t q) {
     uint64_t s = a + b;
@@ -44,54 +42,21 @@ __global__ void map_Bprime_Xinv_twist_kernel(
     int j_dst = (n - j) & (n - 1);  // (-j mod n), n power-of-two
     int dst = j_dst * n + k;
 
-    // limb 0
-    {
-        uint64_t a = B_real[0 * n2 + idx];
-        uint64_t b = B_imag[0 * n2 + idx];
+    for (int limb = 0; limb < RNS_NUM_LIMBS; ++limb) {
+        uint64_t q = d_he_moduli[limb];
+        uint64_t a = B_real[limb * n2 + idx];
+        uint64_t b = B_imag[limb * n2 + idx];
 
         // conj: a + i b  ->  a - i b
-        uint64_t b_conj = neg_mod(b, Q0);
+        uint64_t b_conj = neg_mod(b, q);
 
         if (j == 0) {
-            // scalar = 1
-            Bp_real[0 * n2 + dst] = a;
-            Bp_imag[0 * n2 + dst] = b_conj;
+            Bp_real[limb * n2 + dst] = a;
+            Bp_imag[limb * n2 + dst] = b_conj;
         } else {
             // scalar = -i: (-i) * (a - i b) = -b - i a
-            Bp_real[0 * n2 + dst] = neg_mod(b, Q0);  // -b
-            Bp_imag[0 * n2 + dst] = neg_mod(a, Q0);  // -a
-        }
-    }
-
-    // limb 1
-    {
-        uint64_t a = B_real[1 * n2 + idx];
-        uint64_t b = B_imag[1 * n2 + idx];
-
-        uint64_t b_conj = neg_mod(b, Q1);
-
-        if (j == 0) {
-            Bp_real[1 * n2 + dst] = a;
-            Bp_imag[1 * n2 + dst] = b_conj;
-        } else {
-            Bp_real[1 * n2 + dst] = neg_mod(b, Q1);
-            Bp_imag[1 * n2 + dst] = neg_mod(a, Q1);
-        }
-    }
-
-    // limb 2
-    {
-        uint64_t a = B_real[2 * n2 + idx];
-        uint64_t b = B_imag[2 * n2 + idx];
-
-        uint64_t b_conj = neg_mod(b, Q2);
-
-        if (j == 0) {
-            Bp_real[2 * n2 + dst] = a;
-            Bp_imag[2 * n2 + dst] = b_conj;
-        } else {
-            Bp_real[2 * n2 + dst] = neg_mod(b, Q2);
-            Bp_imag[2 * n2 + dst] = neg_mod(a, Q2);
+            Bp_real[limb * n2 + dst] = neg_mod(b, q);
+            Bp_imag[limb * n2 + dst] = neg_mod(a, q);
         }
     }
 }
@@ -122,43 +87,13 @@ __global__ void trace_gemm_ABpT_rns_kernel(
     int n2 = n * n;
     int out_idx = row * n + col;
 
-    // limb 0
-    {
+    for (int limb = 0; limb < RNS_NUM_LIMBS; ++limb) {
+        uint64_t q = d_he_moduli[limb];
         uint64_t acc_r = 0, acc_i = 0;
-        const uint64_t* Ar = A_real  + 0 * n2;
-        const uint64_t* Ai = A_imag  + 0 * n2;
-        const uint64_t* Br = Bp_real + 0 * n2;
-        const uint64_t* Bi = Bp_imag + 0 * n2;
-
-        for (int t = 0; t < n; t++) {
-            int a_idx = row * n + t;
-            int b_idx = col * n + t; // B'[col,t]
-
-            uint64_t ar = Ar[a_idx], ai = Ai[a_idx];
-            uint64_t br = Br[b_idx], bi = Bi[b_idx];
-
-            uint64_t arbr = mul_mod_u128(ar, br, Q0);
-            uint64_t aibi = mul_mod_u128(ai, bi, Q0);
-            uint64_t arbi = mul_mod_u128(ar, bi, Q0);
-            uint64_t aibr = mul_mod_u128(ai, br, Q0);
-
-            uint64_t prod_r = sub_mod(arbr, aibi, Q0);
-            uint64_t prod_i = add_mod(arbi, aibr, Q0);
-
-            acc_r = add_mod(acc_r, prod_r, Q0);
-            acc_i = add_mod(acc_i, prod_i, Q0);
-        }
-        C_real[0 * n2 + out_idx] = acc_r;
-        C_imag[0 * n2 + out_idx] = acc_i;
-    }
-
-    // limb 1
-    {
-        uint64_t acc_r = 0, acc_i = 0;
-        const uint64_t* Ar = A_real  + 1 * n2;
-        const uint64_t* Ai = A_imag  + 1 * n2;
-        const uint64_t* Br = Bp_real + 1 * n2;
-        const uint64_t* Bi = Bp_imag + 1 * n2;
+        const uint64_t* Ar = A_real  + limb * n2;
+        const uint64_t* Ai = A_imag  + limb * n2;
+        const uint64_t* Br = Bp_real + limb * n2;
+        const uint64_t* Bi = Bp_imag + limb * n2;
 
         for (int t = 0; t < n; t++) {
             int a_idx = row * n + t;
@@ -167,49 +102,20 @@ __global__ void trace_gemm_ABpT_rns_kernel(
             uint64_t ar = Ar[a_idx], ai = Ai[a_idx];
             uint64_t br = Br[b_idx], bi = Bi[b_idx];
 
-            uint64_t arbr = mul_mod_u128(ar, br, Q1);
-            uint64_t aibi = mul_mod_u128(ai, bi, Q1);
-            uint64_t arbi = mul_mod_u128(ar, bi, Q1);
-            uint64_t aibr = mul_mod_u128(ai, br, Q1);
+            uint64_t arbr = mul_mod_u128(ar, br, q);
+            uint64_t aibi = mul_mod_u128(ai, bi, q);
+            uint64_t arbi = mul_mod_u128(ar, bi, q);
+            uint64_t aibr = mul_mod_u128(ai, br, q);
 
-            uint64_t prod_r = sub_mod(arbr, aibi, Q1);
-            uint64_t prod_i = add_mod(arbi, aibr, Q1);
+            uint64_t prod_r = sub_mod(arbr, aibi, q);
+            uint64_t prod_i = add_mod(arbi, aibr, q);
 
-            acc_r = add_mod(acc_r, prod_r, Q1);
-            acc_i = add_mod(acc_i, prod_i, Q1);
+            acc_r = add_mod(acc_r, prod_r, q);
+            acc_i = add_mod(acc_i, prod_i, q);
         }
-        C_real[1 * n2 + out_idx] = acc_r;
-        C_imag[1 * n2 + out_idx] = acc_i;
-    }
-
-    // limb 2
-    {
-        uint64_t acc_r = 0, acc_i = 0;
-        const uint64_t* Ar = A_real  + 2 * n2;
-        const uint64_t* Ai = A_imag  + 2 * n2;
-        const uint64_t* Br = Bp_real + 2 * n2;
-        const uint64_t* Bi = Bp_imag + 2 * n2;
-
-        for (int t = 0; t < n; t++) {
-            int a_idx = row * n + t;
-            int b_idx = col * n + t;
-
-            uint64_t ar = Ar[a_idx], ai = Ai[a_idx];
-            uint64_t br = Br[b_idx], bi = Bi[b_idx];
-
-            uint64_t arbr = mul_mod_u128(ar, br, Q2);
-            uint64_t aibi = mul_mod_u128(ai, bi, Q2);
-            uint64_t arbi = mul_mod_u128(ar, bi, Q2);
-            uint64_t aibr = mul_mod_u128(ai, br, Q2);
-
-            uint64_t prod_r = sub_mod(arbr, aibi, Q2);
-            uint64_t prod_i = add_mod(arbi, aibr, Q2);
-
-            acc_r = add_mod(acc_r, prod_r, Q2);
-            acc_i = add_mod(acc_i, prod_i, Q2);
-        }
-        C_real[2 * n2 + out_idx] = acc_r;
-        C_imag[2 * n2 + out_idx] = acc_i;
+        uint64_t n_mod = (uint64_t)n % q;
+        C_real[limb * n2 + out_idx] = mul_mod_u128(acc_r, n_mod, q);
+        C_imag[limb * n2 + out_idx] = mul_mod_u128(acc_i, n_mod, q);
     }
 }
 
@@ -223,59 +129,17 @@ void trace_gemm_ABpT_rns(
     dim3 blk((n + 15) / 16, (n + 15) / 16);
     trace_gemm_ABpT_rns_kernel<<<blk, thr>>>(A_real, A_imag, Bp_real, Bp_imag, C_real, C_imag, n);
 }
-static constexpr uint64_t INV_DELTA_Q0 = 80764681003797ULL;
-static constexpr uint64_t INV_DELTA_Q1 = 1098975018896ULL;
-static constexpr uint64_t INV_DELTA_Q2 = 14066253496755ULL;
-
-__global__ void rescale_by_delta_kernel(uint64_t* Cre, uint64_t* Cim, int n2) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n2) return;
-
-    // limb 0
-    {
-        uint64_t r = Cre[0 * n2 + idx];
-        uint64_t i = Cim[0 * n2 + idx];
-        Cre[0 * n2 + idx] = mul_mod_u128(r, INV_DELTA_Q0, Q0);
-        Cim[0 * n2 + idx] = mul_mod_u128(i, INV_DELTA_Q0, Q0);
-    }
-    // limb 1
-    {
-        uint64_t r = Cre[1 * n2 + idx];
-        uint64_t i = Cim[1 * n2 + idx];
-        Cre[1 * n2 + idx] = mul_mod_u128(r, INV_DELTA_Q1, Q1);
-        Cim[1 * n2 + idx] = mul_mod_u128(i, INV_DELTA_Q1, Q1);
-    }
-    // limb 2
-    {
-        uint64_t r = Cre[2 * n2 + idx];
-        uint64_t i = Cim[2 * n2 + idx];
-        Cre[2 * n2 + idx] = mul_mod_u128(r, INV_DELTA_Q2, Q2);
-        Cim[2 * n2 + idx] = mul_mod_u128(i, INV_DELTA_Q2, Q2);
-    }
-}
-
 __global__ void rescale_by_delta_kernel(uint64_t* Cre, uint64_t* Cim, int n2,
-                                        uint64_t inv0, uint64_t inv1, uint64_t inv2) {
+                                        const uint64_t* inv) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n2) return;
 
-    // limb0
-    {
-        uint64_t r = Cre[0*n2 + idx], i = Cim[0*n2 + idx];
-        Cre[0*n2 + idx] = mul_mod_u128(r, inv0, Q0);
-        Cim[0*n2 + idx] = mul_mod_u128(i, inv0, Q0);
-    }
-    // limb1
-    {
-        uint64_t r = Cre[1*n2 + idx], i = Cim[1*n2 + idx];
-        Cre[1*n2 + idx] = mul_mod_u128(r, inv1, Q1);
-        Cim[1*n2 + idx] = mul_mod_u128(i, inv1, Q1);
-    }
-    // limb2
-    {
-        uint64_t r = Cre[2*n2 + idx], i = Cim[2*n2 + idx];
-        Cre[2*n2 + idx] = mul_mod_u128(r, inv2, Q2);
-        Cim[2*n2 + idx] = mul_mod_u128(i, inv2, Q2);
+    for (int limb = 0; limb < RNS_NUM_LIMBS; ++limb) {
+        uint64_t q = d_he_moduli[limb];
+        uint64_t r = Cre[limb * n2 + idx];
+        uint64_t i = Cim[limb * n2 + idx];
+        Cre[limb * n2 + idx] = mul_mod_u128(r, inv[limb], q);
+        Cim[limb * n2 + idx] = mul_mod_u128(i, inv[limb], q);
     }
 }
 
@@ -284,7 +148,16 @@ void rescale_by_delta_rns(uint64_t* C_real, uint64_t* C_imag, int n, int /*rns_l
     int n2 = n*n;
     int threads = 256;
     int blocks  = (n2 + threads - 1) / threads;
-    rescale_by_delta_kernel<<<blocks, threads>>>(C_real, C_imag, n2, inv0, inv1, inv2);
+    uint64_t inv[RNS_NUM_LIMBS] = {0};
+    inv[0] = inv0;
+    if (RNS_NUM_LIMBS > 1) inv[1] = inv1;
+    if (RNS_NUM_LIMBS > 2) inv[2] = inv2;
+
+    uint64_t* d_inv = nullptr;
+    cudaMalloc(&d_inv, RNS_NUM_LIMBS * sizeof(uint64_t));
+    cudaMemcpy(d_inv, inv, RNS_NUM_LIMBS * sizeof(uint64_t), cudaMemcpyHostToDevice);
+    rescale_by_delta_kernel<<<blocks, threads>>>(C_real, C_imag, n2, d_inv);
+    cudaFree(d_inv);
 }
 
 

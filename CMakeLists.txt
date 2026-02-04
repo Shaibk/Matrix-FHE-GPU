@@ -72,6 +72,9 @@ file(GLOB_RECURSE MY_SRC_FILES
     src/*.cpp
 )
 
+set(MY_SRC_CORE_FILES ${MY_SRC_FILES})
+list(REMOVE_ITEM MY_SRC_CORE_FILES ${CMAKE_CURRENT_SOURCE_DIR}/src/main.cu)
+
 # ==========================================
 # 4. Build Target
 # ==========================================
@@ -97,5 +100,75 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
 endif()
 
 target_link_libraries(matrix_fhe_gpu PRIVATE m)
+
+add_executable(test_encode_decode_wcrt
+    test/test_encode_decode_wcrt.cu
+    ${MY_SRC_CORE_FILES}
+    ${PHANTOM_SOURCES}
+)
+
+target_include_directories(test_encode_decode_wcrt PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${PHANTOM_HOME}/include
+    ${PHANTOM_HOME}/src
+)
+
+target_link_libraries(test_encode_decode_wcrt PRIVATE m)
+
+add_executable(test_encode_encrypt_decrypt_decode_wcrt
+    test/test_encode_encrypt_decrypt_decode_wcrt.cu
+    ${MY_SRC_CORE_FILES}
+    ${PHANTOM_SOURCES}
+)
+
+target_include_directories(test_encode_encrypt_decrypt_decode_wcrt PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${PHANTOM_HOME}/include
+    ${PHANTOM_HOME}/src
+)
+
+target_link_libraries(test_encode_encrypt_decrypt_decode_wcrt PRIVATE m)
+
+add_executable(test_custom_ntt_roundtrip
+    test/test_custom_ntt_roundtrip.cu
+    ${MY_SRC_CORE_FILES}
+    ${PHANTOM_SOURCES}
+)
+
+target_include_directories(test_custom_ntt_roundtrip PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${PHANTOM_HOME}/include
+    ${PHANTOM_HOME}/src
+)
+
+target_link_libraries(test_custom_ntt_roundtrip PRIVATE m)
+
+add_executable(test_wcrt_roundtrip
+    test/test_wcrt_roundtrip.cu
+    ${MY_SRC_CORE_FILES}
+    ${PHANTOM_SOURCES}
+)
+
+target_include_directories(test_wcrt_roundtrip PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${PHANTOM_HOME}/include
+    ${PHANTOM_HOME}/src
+)
+
+target_link_libraries(test_wcrt_roundtrip PRIVATE m)
+
+add_executable(test_decrypt_to_eval_compare
+    test/test_decrypt_to_eval_compare.cu
+    ${MY_SRC_CORE_FILES}
+    ${PHANTOM_SOURCES}
+)
+
+target_include_directories(test_decrypt_to_eval_compare PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${PHANTOM_HOME}/include
+    ${PHANTOM_HOME}/src
+)
+
+target_link_libraries(test_decrypt_to_eval_compare PRIVATE m)
 
 message(STATUS "Configured matrix-fhe-gpu with FULL Phantom sources.")

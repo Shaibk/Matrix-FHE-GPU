@@ -61,8 +61,8 @@ bool check_is_zero(const uint64_t* d_ptr, size_t words, const char* name) {
 }
 
 int main() {
-    constexpr int PHI = 16;
-    const int n  = MAT_N;
+    constexpr int PHI = BATCH_SIZE;
+    const int n  = MATRIX_N;
     const int n2 = n * n;
     const int RNS_LIMBS = RNS_NUM_LIMBS;
     const double DELTA = SCALING_FACTOR / n;
@@ -82,10 +82,8 @@ int main() {
         auto* A_ptr = h_A.data() + l_logical * n2;
 
         // --- 矩阵 B* ---
-        // Map 算子会在 GPU 上执行 W^-1 (物理上是 src = 15 - dst)
-        // 为了抵消这个逆序，我们在初始化时直接把 "逻辑 Batch l" 的数据
-        // 写到 "物理位置 (15-l)"。这就是零开销预重排。
-        int l_physical_B = (PHI - 1) - l_logical;
+        // W-CRT 域不再进行 W 维度的置换
+        int l_physical_B = l_logical;
         auto* Bs_ptr = h_Bstar.data() + l_physical_B * n2;
 
         for (int i = 0; i < n; ++i) {
@@ -122,8 +120,8 @@ int main() {
     cuda_check(cudaMalloc(&d_Bs_packed_im, packed_words*sizeof(uint64_t)), "malloc Bs packed");
 
     BatchedEncoder batched_enc(n);
-    batched_enc.encode_packed_p17(d_Amsg,  d_A_packed_re,  d_A_packed_im);
-    batched_enc.encode_packed_p17(d_Bsmsg, d_Bs_packed_re, d_Bs_packed_im);
+    batched_enc.encode_to_wntt_eval(d_Amsg,  d_A_packed_re,  d_A_packed_im);
+    batched_enc.encode_to_wntt_eval(d_Bsmsg, d_Bs_packed_re, d_Bs_packed_im);
     cuda_sync("Encode Packed");
 
     // 4. Convert Packed -> Eval (W-NTT)
@@ -181,7 +179,7 @@ int main() {
     
     // d_C_eval_re 已经在 Eval 域了，直接 Decode
     for (int ell = 0; ell < PHI; ++ell) {
-        single_enc.decode(
+        single_enc.decode_lane_from_rns_eval(
             d_C_eval_re + ell * blk_words,
             d_C_eval_im + ell * blk_words,
             d_C_out_buf + ell * n2

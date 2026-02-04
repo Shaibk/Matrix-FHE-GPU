@@ -4,6 +4,7 @@
 #include <iostream>
 #include <vector>
 #include <cmath>
+#include <stdexcept>
 
 namespace matrix_fhe {
 using namespace phantom_math;
@@ -23,22 +24,224 @@ uint64_t modInverse(uint64_t n, uint64_t mod) {
 // --- Device Kernels ---
 __device__ int d_dbg_once = 0;
 
+__constant__ uint64_t d_rns_moduli[RNS_NUM_LIMBS];
+
+// Fixed-size big integer limbs for CRT reconstruction (little-endian limbs)
+static constexpr int BIGINT_LIMBS = 7;
+__constant__ uint64_t d_crt_M[RNS_NUM_LIMBS * BIGINT_LIMBS];   // M_i = Q / q_i
+__constant__ uint64_t d_crt_Q[BIGINT_LIMBS];
+__constant__ uint64_t d_crt_Q_half[BIGINT_LIMBS];
+__constant__ uint64_t d_crt_inv[RNS_NUM_LIMBS];               // inv_i = (M_i^-1 mod q_i)
+
 __global__ void quantize_soa_kernel(const cuDoubleComplex* input, 
                                   uint64_t* out_real, uint64_t* out_imag, 
-                                  int n, double delta, 
-                                  uint64_t q0, uint64_t q1, uint64_t q2) {
+                                  int n, double delta, int limbs) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
         int64_t ix = llround(cuCreal(input[idx]) * delta);
         int64_t iy = llround(cuCimag(input[idx]) * delta);
-        uint64_t m[3] = {q0, q1, q2};
-        #pragma unroll
-        for(int k=0; k<3; k++) {
+        for(int k=0; k<limbs; k++) {
+            uint64_t q = d_rns_moduli[k];
             int out_idx = k * n + idx;
-            int64_t mx = ix % (int64_t)m[k]; if(mx < 0) mx += m[k]; out_real[out_idx] = mx;
-            int64_t my = iy % (int64_t)m[k]; if(my < 0) my += m[k]; out_imag[out_idx] = my;
+            int64_t mx = ix % (int64_t)q; if(mx < 0) mx += q; out_real[out_idx] = mx;
+            int64_t my = iy % (int64_t)q; if(my < 0) my += q; out_imag[out_idx] = my;
         }
     }
+}
+
+// ----------------- Exact CRT Reconstruction (device) -----------------
+__device__ __forceinline__ int big_cmp(const uint64_t* a, const uint64_t* b) {
+    for (int i = BIGINT_LIMBS - 1; i >= 0; --i) {
+        if (a[i] > b[i]) return 1;
+        if (a[i] < b[i]) return -1;
+    }
+    return 0;
+}
+
+__device__ __forceinline__ void big_add_inplace(uint64_t* a, const uint64_t* b) {
+    unsigned __int128 carry = 0;
+    for (int i = 0; i < BIGINT_LIMBS; ++i) {
+        unsigned __int128 s = (unsigned __int128)a[i] + b[i] + carry;
+        a[i] = (uint64_t)s;
+        carry = s >> 64;
+    }
+}
+
+__device__ __forceinline__ void big_sub_inplace(uint64_t* a, const uint64_t* b) {
+    uint64_t borrow = 0;
+    for (int i = 0; i < BIGINT_LIMBS; ++i) {
+        uint64_t bi = b[i] + borrow;
+        borrow = (a[i] < bi);
+        a[i] -= bi;
+    }
+}
+
+__device__ __forceinline__ void big_sub_rev(uint64_t* out, const uint64_t* a, const uint64_t* b) {
+    // out = b - a  (assumes b >= a)
+    uint64_t borrow = 0;
+    for (int i = 0; i < BIGINT_LIMBS; ++i) {
+        uint64_t ai = a[i] + borrow;
+        borrow = (b[i] < ai);
+        out[i] = b[i] - ai;
+    }
+}
+
+__device__ __forceinline__ void big_mul_u64(const uint64_t* a, uint64_t m, uint64_t* out) {
+    unsigned __int128 carry = 0;
+    for (int i = 0; i < BIGINT_LIMBS; ++i) {
+        unsigned __int128 p = (unsigned __int128)a[i] * m + carry;
+        out[i] = (uint64_t)p;
+        carry = p >> 64;
+    }
+}
+
+__device__ __forceinline__ double big_to_double(const uint64_t* a) {
+    const double two64 = 18446744073709551616.0; // 2^64
+    double v = 0.0;
+    for (int i = BIGINT_LIMBS - 1; i >= 0; --i) {
+        v = v * two64 + (double)a[i];
+    }
+    return v;
+}
+
+__device__ __forceinline__ uint64_t mul_mod_u128(uint64_t a, uint64_t b, uint64_t mod) {
+    unsigned __int128 p = (unsigned __int128)a * (unsigned __int128)b;
+    return (uint64_t)(p % mod);
+}
+
+__global__ void dequantize_exact_kernel(
+    const uint64_t* in_real, const uint64_t* in_imag,
+    cuDoubleComplex* output, int n, double delta, int limbs
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    auto reconstruct = [&](const uint64_t* data) -> double {
+        uint64_t acc[BIGINT_LIMBS];
+        for (int i = 0; i < BIGINT_LIMBS; ++i) acc[i] = 0;
+
+        for (int k = 0; k < limbs; ++k) {
+            uint64_t qi = d_rns_moduli[k];
+            uint64_t xk = data[k * n + idx];
+            uint64_t t = mul_mod_u128(xk, d_crt_inv[k], qi);
+
+            uint64_t term[BIGINT_LIMBS];
+            const uint64_t* Mk = &d_crt_M[k * BIGINT_LIMBS];
+            big_mul_u64(Mk, t, term);           // term = M_k * t (term < Q)
+            big_add_inplace(acc, term);         // acc += term
+            if (big_cmp(acc, d_crt_Q) >= 0) {
+                big_sub_inplace(acc, d_crt_Q);  // acc -= Q
+            }
+        }
+
+        bool neg = false;
+        if (big_cmp(acc, d_crt_Q_half) > 0) {
+            uint64_t mag[BIGINT_LIMBS];
+            big_sub_rev(mag, acc, d_crt_Q);     // mag = Q - acc
+            for (int i = 0; i < BIGINT_LIMBS; ++i) acc[i] = mag[i];
+            neg = true;
+        }
+
+        double val = big_to_double(acc) / delta;
+        return neg ? -val : val;
+    };
+
+    output[idx] = make_cuDoubleComplex(reconstruct(in_real), reconstruct(in_imag));
+}
+
+__global__ void crt_compose_centerlift_kernel(
+    const uint64_t* in_rns,
+    int64_t* out_centered,
+    int n2,
+    int limbs
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n2) return;
+
+    uint64_t acc[BIGINT_LIMBS];
+    for (int i = 0; i < BIGINT_LIMBS; ++i) acc[i] = 0;
+
+    for (int k = 0; k < limbs; ++k) {
+        uint64_t qi = d_rns_moduli[k];
+        uint64_t xk = in_rns[k * n2 + idx];
+        uint64_t t = mul_mod_u128(xk, d_crt_inv[k], qi);
+
+        uint64_t term[BIGINT_LIMBS];
+        const uint64_t* Mk = &d_crt_M[k * BIGINT_LIMBS];
+        big_mul_u64(Mk, t, term);
+        big_add_inplace(acc, term);
+        if (big_cmp(acc, d_crt_Q) >= 0) {
+            big_sub_inplace(acc, d_crt_Q);
+        }
+    }
+
+    bool neg = false;
+    if (big_cmp(acc, d_crt_Q_half) > 0) {
+        uint64_t mag[BIGINT_LIMBS];
+        big_sub_rev(mag, acc, d_crt_Q);
+        for (int i = 0; i < BIGINT_LIMBS; ++i) acc[i] = mag[i];
+        neg = true;
+    }
+
+    // Expected message coefficients are in small range; clamp if host uses larger values.
+    int64_t v = (int64_t)acc[0];
+    out_centered[idx] = neg ? -v : v;
+}
+
+__global__ void crt_compose_centerlift_big_kernel(
+    const uint64_t* in_rns,
+    uint64_t* out_mag,
+    uint8_t* out_neg,
+    int n2,
+    int limbs
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n2) return;
+
+    uint64_t acc[BIGINT_LIMBS];
+    for (int i = 0; i < BIGINT_LIMBS; ++i) acc[i] = 0;
+
+    for (int k = 0; k < limbs; ++k) {
+        uint64_t qi = d_rns_moduli[k];
+        uint64_t xk = in_rns[k * n2 + idx];
+        uint64_t t = mul_mod_u128(xk, d_crt_inv[k], qi);
+
+        uint64_t term[BIGINT_LIMBS];
+        const uint64_t* Mk = &d_crt_M[k * BIGINT_LIMBS];
+        big_mul_u64(Mk, t, term);
+        big_add_inplace(acc, term);
+        if (big_cmp(acc, d_crt_Q) >= 0) {
+            big_sub_inplace(acc, d_crt_Q);
+        }
+    }
+
+    bool neg = false;
+    uint64_t mag[BIGINT_LIMBS];
+    if (big_cmp(acc, d_crt_Q_half) > 0) {
+        big_sub_rev(mag, acc, d_crt_Q); // mag = Q - acc
+        neg = true;
+    } else {
+        for (int i = 0; i < BIGINT_LIMBS; ++i) mag[i] = acc[i];
+    }
+
+    size_t base = (size_t)idx * BIGINT_LIMBS;
+    for (int i = 0; i < BIGINT_LIMBS; ++i) out_mag[base + (size_t)i] = mag[i];
+    out_neg[idx] = (uint8_t)(neg ? 1 : 0);
+}
+
+void crt_compose_centerlift_big(
+    const uint64_t* d_in_rns,
+    uint64_t* d_out_mag,
+    uint8_t* d_out_neg,
+    int n2,
+    int limbs,
+    cudaStream_t stream
+) {
+    int threads = 256;
+    int blocks = (n2 + threads - 1) / threads;
+    crt_compose_centerlift_big_kernel<<<blocks, threads, 0, stream>>>(
+        d_in_rns, d_out_mag, d_out_neg, n2, limbs
+    );
 }
 
 // 192-bit Helper: Accumulate
@@ -87,137 +290,24 @@ __device__ void sub_rev_192(const uint64_t* A, uint64_t B0, uint64_t B1, uint64_
     );
 }
 
-// 2. Exact Dequantize: 192-bit Integer CRT
-__global__ void dequantize_exact_kernel(
+// 2. Approx Dequantize: floating CRT (kept for reference)
+__global__ void dequantize_approx_kernel(
     const uint64_t* in_real, const uint64_t* in_imag,
     cuDoubleComplex* output, int n, double delta,
-    // CRT Parameters
-    uint64_t c0, uint64_t c1, uint64_t c2,
-    uint64_t c0_sh, uint64_t c1_sh, uint64_t c2_sh,
-    uint64_t q0, uint64_t q1, uint64_t q2,
-    // Q/qi
-    uint64_t Q0_L, uint64_t Q0_H,
-    uint64_t Q1_L, uint64_t Q1_H,
-    uint64_t Q2_L, uint64_t Q2_H,
-    // Total Q (192-bit)
-    uint64_t Q_L, uint64_t Q_M, uint64_t Q_H
+    const double* crt_coeff, double q_total, double q_half, int limbs
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
 
-    // 常量定义
-    const double TWO_64  = 18446744073709551616.0; // 2^64
-    const double TWO_128 = TWO_64 * TWO_64;        // 2^128
-
-    // Helper: 192-bit -> double conversion (debug/approx)
-    auto to_double = [&](const uint64_t v[3]) -> double {
-        return (double)v[2] * TWO_128 + (double)v[1] * TWO_64 + (double)v[0];
-    };
-
     auto reconstruct = [&](const uint64_t* data) -> double {
-        uint64_t x0 = data[0 * n + idx];
-        uint64_t x1 = data[1 * n + idx];
-        uint64_t x2 = data[2 * n + idx];
-
-        uint64_t acc[3] = {0, 0, 0};
-
-        // Term 0
-        uint64_t v0 = multiply_and_reduce_shoup(x0, c0, c0_sh, q0);
-        unsigned __int128 p0 = (unsigned __int128)v0 * Q0_L;
-        add_to_192(acc, (uint64_t)p0, (uint64_t)(p0 >> 64));
-        p0 = (unsigned __int128)v0 * Q0_H;
-        asm("add.cc.u64 %0, %0, %1;" : "+l"(acc[1]) : "l"((uint64_t)p0));
-        asm("addc.u64 %0, %0, %1;"   : "+l"(acc[2]) : "l"((uint64_t)(p0 >> 64)));
-
-        // Term 1
-        uint64_t v1 = multiply_and_reduce_shoup(x1, c1, c1_sh, q1);
-        unsigned __int128 p1 = (unsigned __int128)v1 * Q1_L;
-        add_to_192(acc, (uint64_t)p1, (uint64_t)(p1 >> 64));
-        p1 = (unsigned __int128)v1 * Q1_H;
-        asm("add.cc.u64 %0, %0, %1;" : "+l"(acc[1]) : "l"((uint64_t)p1));
-        asm("addc.u64 %0, %0, %1;"   : "+l"(acc[2]) : "l"((uint64_t)(p1 >> 64)));
-
-        // Term 2
-        uint64_t v2 = multiply_and_reduce_shoup(x2, c2, c2_sh, q2);
-        unsigned __int128 p2 = (unsigned __int128)v2 * Q2_L;
-        add_to_192(acc, (uint64_t)p2, (uint64_t)(p2 >> 64));
-        p2 = (unsigned __int128)v2 * Q2_H;
-        asm("add.cc.u64 %0, %0, %1;" : "+l"(acc[1]) : "l"((uint64_t)p2));
-        asm("addc.u64 %0, %0, %1;"   : "+l"(acc[2]) : "l"((uint64_t)(p2 >> 64)));
-
-        // Modulo Reduction: while (acc >= Q) acc -= Q;
-        while (ge_192(acc, Q_L, Q_M, Q_H)) {
-            sub_192(acc, Q_L, Q_M, Q_H);
+        double sum = 0.0;
+        for (int k = 0; k < limbs; ++k) {
+            double x = (double)data[k * n + idx];
+            sum += x * crt_coeff[k];
         }
-
-        // Center Lift: if (acc >= Q/2) treat as negative
-        uint64_t Q_half_L = (Q_L >> 1) | ((Q_M & 1ULL) << 63);
-        uint64_t Q_half_M = (Q_M >> 1) | ((Q_H & 1ULL) << 63);
-        uint64_t Q_half_H = (Q_H >> 1);
-
-        bool neg = ge_192(acc, Q_half_L, Q_half_M, Q_half_H);
-
-        // =========================
-        // Strong debug print: only once
-        // =========================
-        if (idx == 0) {
-            if (atomicCAS(&d_dbg_once, 0, 1) == 0) {
-                printf("\n[DBG] ---- dequantize_exact_kernel idx=0 ----\n");
-                printf("[DBG] x0,x1,x2 = %llu, %llu, %llu\n",
-                       (unsigned long long)x0,
-                       (unsigned long long)x1,
-                       (unsigned long long)x2);
-
-                printf("[DBG] acc (mod Q) limbs = %llu, %llu, %llu\n",
-                       (unsigned long long)acc[0],
-                       (unsigned long long)acc[1],
-                       (unsigned long long)acc[2]);
-
-                printf("[DBG] Q limbs   = %llu, %llu, %llu\n",
-                       (unsigned long long)Q_L,
-                       (unsigned long long)Q_M,
-                       (unsigned long long)Q_H);
-
-                printf("[DBG] Q/2 limbs = %llu, %llu, %llu\n",
-                       (unsigned long long)Q_half_L,
-                       (unsigned long long)Q_half_M,
-                       (unsigned long long)Q_half_H);
-
-                printf("[DBG] acc >= Q/2 ? %d\n", (int)neg);
-
-                if (neg) {
-                    // diff = Q - acc (magnitude of negative)
-                    uint64_t diff[3];
-                    sub_rev_192(acc, Q_L, Q_M, Q_H, diff); // diff = Q - acc
-                    printf("[DBG] diff=Q-acc = %llu, %llu, %llu\n",
-                           (unsigned long long)diff[0],
-                           (unsigned long long)diff[1],
-                           (unsigned long long)diff[2]);
-
-                    double mag = to_double(diff);
-                    printf("[DBG] signed_int approx = -%.6e\n", mag);
-                    printf("[DBG] signed_int/delta approx = -%.6e\n", mag / delta);
-                } else {
-                    double val = to_double(acc);
-                    printf("[DBG] signed_int approx = +%.6e\n", val);
-                    printf("[DBG] signed_int/delta approx = +%.6e\n", val / delta);
-                }
-
-                printf("[DBG] delta = %.6e\n", delta);
-                printf("[DBG] -------------------------------------\n\n");
-            }
-        }
-
-        double val_double = 0.0;
-        if (neg) {
-            uint64_t diff[3];
-            sub_rev_192(acc, Q_L, Q_M, Q_H, diff);  // diff = Q - acc
-            val_double = -to_double(diff);
-        } else {
-            val_double = to_double(acc);
-        }
-
-        return val_double / delta;
+        sum = fmod(sum, q_total);
+        if (sum > q_half) sum -= q_total;
+        return sum / delta;
     };
 
     output[idx] = make_cuDoubleComplex(reconstruct(in_real), reconstruct(in_imag));
@@ -241,6 +331,94 @@ Encoder::Encoder(int n_dim) : n(n_dim) {
     cudaMalloc(&d_V_cx, sz); cudaMalloc(&d_V_cx_T, sz);
     cudaMalloc(&d_V_inv_cx, sz); cudaMalloc(&d_V_inv_cx_T, sz);
     init_complex_matrices();
+
+    static bool moduli_inited = false;
+    if (!moduli_inited) {
+        cudaMemcpyToSymbol(d_rns_moduli, RNS_MODULI, sizeof(RNS_MODULI));
+        moduli_inited = true;
+    }
+
+    // Init exact CRT tables once
+    static bool crt_inited = false;
+    if (!crt_inited) {
+        // Host big-int helpers (little-endian limbs)
+        auto big_mul_u64_host = [](const std::vector<uint64_t>& a, uint64_t m) {
+            std::vector<uint64_t> out(BIGINT_LIMBS, 0);
+            unsigned __int128 carry = 0;
+            for (int i = 0; i < BIGINT_LIMBS; ++i) {
+                unsigned __int128 p = (unsigned __int128)a[i] * m + carry;
+                out[i] = (uint64_t)p;
+                carry = p >> 64;
+            }
+            if (carry != 0) {
+                throw std::runtime_error("CRT Q overflow: increase BIGINT_LIMBS");
+            }
+            return out;
+        };
+        auto big_div_u64_host = [](const std::vector<uint64_t>& a, uint64_t d, uint64_t* rem_out) {
+            std::vector<uint64_t> q(BIGINT_LIMBS, 0);
+            unsigned __int128 rem = 0;
+            for (int i = BIGINT_LIMBS - 1; i >= 0; --i) {
+                unsigned __int128 cur = (rem << 64) | a[i];
+                q[i] = (uint64_t)(cur / d);
+                rem = cur % d;
+            }
+            if (rem_out) *rem_out = (uint64_t)rem;
+            return q;
+        };
+        auto big_mod_u64_host = [](const std::vector<uint64_t>& a, uint64_t m) {
+            unsigned __int128 rem = 0;
+            for (int i = BIGINT_LIMBS - 1; i >= 0; --i) {
+                unsigned __int128 cur = (rem << 64) | a[i];
+                rem = cur % m;
+            }
+            return (uint64_t)rem;
+        };
+        auto big_shift_right1 = [](const std::vector<uint64_t>& a) {
+            std::vector<uint64_t> out(BIGINT_LIMBS, 0);
+            uint64_t carry = 0;
+            for (int i = BIGINT_LIMBS - 1; i >= 0; --i) {
+                uint64_t cur = a[i];
+                out[i] = (cur >> 1) | (carry << 63);
+                carry = cur & 1;
+            }
+            return out;
+        };
+
+        // Build Q
+        std::vector<uint64_t> Q(BIGINT_LIMBS, 0);
+        Q[0] = 1;
+        for (int i = 0; i < RNS_NUM_LIMBS; ++i) {
+            Q = big_mul_u64_host(Q, RNS_MODULI[i]);
+        }
+        std::vector<uint64_t> Q_half = big_shift_right1(Q);
+
+        // Build M_i and inv_i
+        std::vector<uint64_t> h_crt_M(RNS_NUM_LIMBS * BIGINT_LIMBS, 0);
+        std::vector<uint64_t> h_crt_inv(RNS_NUM_LIMBS, 0);
+        for (int i = 0; i < RNS_NUM_LIMBS; ++i) {
+            uint64_t qi = RNS_MODULI[i];
+            uint64_t rem = 0;
+            std::vector<uint64_t> Mi = big_div_u64_host(Q, qi, &rem);
+            if (rem != 0) {
+                throw std::runtime_error("CRT Q not divisible by qi");
+            }
+            uint64_t Mi_mod_qi = big_mod_u64_host(Mi, qi);
+            uint64_t inv = modInverse(Mi_mod_qi, qi);
+            h_crt_inv[i] = inv;
+            for (int j = 0; j < BIGINT_LIMBS; ++j) {
+                h_crt_M[i * BIGINT_LIMBS + j] = Mi[j];
+            }
+        }
+
+        cudaMemcpyToSymbol(d_crt_M, h_crt_M.data(),
+                           h_crt_M.size() * sizeof(uint64_t));
+        cudaMemcpyToSymbol(d_crt_inv, h_crt_inv.data(),
+                           h_crt_inv.size() * sizeof(uint64_t));
+        cudaMemcpyToSymbol(d_crt_Q, Q.data(), Q.size() * sizeof(uint64_t));
+        cudaMemcpyToSymbol(d_crt_Q_half, Q_half.data(), Q_half.size() * sizeof(uint64_t));
+        crt_inited = true;
+    }
 }
 Encoder::~Encoder() { cudaFree(d_V_cx); cudaFree(d_V_cx_T); cudaFree(d_V_inv_cx); cudaFree(d_V_inv_cx_T); }
 
@@ -266,18 +444,30 @@ void Encoder::init_complex_matrices() {
 }
 
 void Encoder::encode(const cuDoubleComplex* d_msg, uint64_t* d_real_rns, uint64_t* d_imag_rns) {
-    cuDoubleComplex *dT, *dP; cudaMalloc(&dT, n*n*16); cudaMalloc(&dP, n*n*16);
+    cuDoubleComplex *dT, *dP, *dM;
+    cudaMalloc(&dT, n*n*16);
+    cudaMalloc(&dP, n*n*16);
+    cudaMalloc(&dM, n*n*16);
     dim3 blk((n+15)/16, (n+15)/16), thr(16,16);
     mat_mul_kernel_complex<<<blk, thr>>>(d_V_inv_cx, d_msg, dT, n);
     mat_mul_kernel_complex<<<blk, thr>>>(dT, d_V_inv_cx_T, dP, n);
     int threads = 256; int blocks = (n*n + 255)/256;
-    quantize_soa_kernel<<<blocks, threads>>>(dP, d_real_rns, d_imag_rns, n*n, SCALING_FACTOR, 
-                                           RNS_MODULI[0], RNS_MODULI[1], RNS_MODULI[2]);
+    quantize_soa_kernel<<<blocks, threads>>>(dP, d_real_rns, d_imag_rns, n*n, SCALING_FACTOR, RNS_NUM_LIMBS);
     cudaFree(dT); cudaFree(dP);
     cudaDeviceSynchronize();
 }
 
-void Encoder::decode(const uint64_t* d_real_rns, const uint64_t* d_imag_rns, cuDoubleComplex* d_msg) {
+void Encoder::idft2(const cuDoubleComplex* d_eval_xy, cuDoubleComplex* d_coeff_xy) {
+    cuDoubleComplex* dT = nullptr;
+    cudaMalloc(&dT, n * n * sizeof(cuDoubleComplex));
+    dim3 blk((n + 15) / 16, (n + 15) / 16), thr(16, 16);
+    mat_mul_kernel_complex<<<blk, thr>>>(d_V_inv_cx, d_eval_xy, dT, n);
+    mat_mul_kernel_complex<<<blk, thr>>>(dT, d_V_inv_cx_T, d_coeff_xy, n);
+    cudaFree(dT);
+}
+
+// Lane-level decode helper for encode/decode verification (not the encrypted HE decode path).
+void Encoder::decode_lane_from_rns_eval(const uint64_t* d_real_rns, const uint64_t* d_imag_rns, cuDoubleComplex* d_msg) {
     // n*n*16 complex entries
     const size_t nn = (size_t)n * (size_t)n;
     const size_t elems = nn * 16;
@@ -285,66 +475,29 @@ void Encoder::decode(const uint64_t* d_real_rns, const uint64_t* d_imag_rns, cuD
     cuDoubleComplex* dP = nullptr;
     cudaMalloc(&dP, elems * sizeof(cuDoubleComplex));
 
-    uint64_t q0 = RNS_MODULI[0], q1 = RNS_MODULI[1], q2 = RNS_MODULI[2];
-
-    // 128-bit Q_star
-    unsigned __int128 Q0 = (unsigned __int128)q1 * q2;
-    unsigned __int128 Q1 = (unsigned __int128)q0 * q2;
-    unsigned __int128 Q2 = (unsigned __int128)q0 * q1;
-
-    uint64_t Q0_L = (uint64_t)Q0; uint64_t Q0_H = (uint64_t)(Q0 >> 64);
-    uint64_t Q1_L = (uint64_t)Q1; uint64_t Q1_H = (uint64_t)(Q1 >> 64);
-    uint64_t Q2_L = (uint64_t)Q2; uint64_t Q2_H = (uint64_t)(Q2 >> 64);
-
-    uint64_t c0 = modInverse((uint64_t)(Q0 % q0), q0);
-    uint64_t c1 = modInverse((uint64_t)(Q1 % q1), q1);
-    uint64_t c2 = modInverse((uint64_t)(Q2 % q2), q2);
-
-    uint64_t c0_sh = compute_shoup(c0, q0);
-    uint64_t c1_sh = compute_shoup(c1, q1);
-    uint64_t c2_sh = compute_shoup(c2, q2);
-
-    // Q = q0*q1*q2 as 192-bit split (Q_L, Q_M, Q_H)
-    unsigned __int128 term_lo = (unsigned __int128)Q0_L * q0;
-    unsigned __int128 term_hi = (unsigned __int128)Q0_H * q0;
-
-    uint64_t Q_L = (uint64_t)term_lo;
-    uint64_t term_lo_high = (uint64_t)(term_lo >> 64);
-    uint64_t term_hi_low  = (uint64_t)term_hi;
-
-    uint64_t Q_M = term_lo_high + term_hi_low;
-    uint64_t carry = (Q_M < term_lo_high) ? 1 : 0;
-    uint64_t Q_H = (uint64_t)(term_hi >> 64) + carry;
-
     int threads = 256;
     int blocks  = (int)((nn + threads - 1) / threads);
 
     dequantize_exact_kernel<<<blocks, threads>>>(
-        d_real_rns, d_imag_rns,
-        dP,
-        (int)nn,
-        SCALING_FACTOR,
-        c0, c1, c2,
-        c0_sh, c1_sh, c2_sh,
-        q0, q1, q2,
-        Q0_L, Q0_H,
-        Q1_L, Q1_H,
-        Q2_L, Q2_H,
-        Q_L, Q_M, Q_H
+        d_real_rns, d_imag_rns, dP, (int)nn, SCALING_FACTOR, RNS_NUM_LIMBS
     );
     cudaDeviceSynchronize();
 
-    cuDoubleComplex* dT = nullptr;
-    cudaMalloc(&dT, elems * sizeof(cuDoubleComplex));
-
-    dim3 blk((n + 15) / 16, (n + 15) / 16);
-    dim3 thr(16, 16);
-    mat_mul_kernel_complex<<<blk, thr>>>(d_V_cx,   dP, dT,    n);
-    mat_mul_kernel_complex<<<blk, thr>>>(dT, d_V_cx_T, d_msg, n);
+    decode_from_eval_complex(dP, d_msg);
 
     cudaFree(dP);
-    cudaFree(dT);
     cudaDeviceSynchronize();
+}
+
+void Encoder::decode_from_eval_complex(const cuDoubleComplex* d_eval, cuDoubleComplex* d_msg) {
+    const size_t elems = (size_t)n * (size_t)n;
+    cuDoubleComplex* dT = nullptr;
+    cudaMalloc(&dT, elems * sizeof(cuDoubleComplex));
+    dim3 blk((n + 15) / 16, (n + 15) / 16);
+    dim3 thr(16, 16);
+    mat_mul_kernel_complex<<<blk, thr>>>(d_V_cx, d_eval, dT, n);
+    mat_mul_kernel_complex<<<blk, thr>>>(dT, d_V_cx_T, d_msg, n);
+    cudaFree(dT);
 }
 
 }

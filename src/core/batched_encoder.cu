@@ -1,6 +1,7 @@
 #include "../../include/core/batched_encoder.cuh"
 #include "../../include/core/encoder.cuh"
 #include "../../include/core/config.h"
+#include "../../include/core/HE.cuh"
 
 #include <cuda_runtime.h>
 #include <cstdint>
@@ -8,6 +9,7 @@
 #include <stdexcept>
 #include <iostream>
 #include <algorithm>
+#include <complex>
 
 namespace matrix_fhe {
 
@@ -54,149 +56,99 @@ static uint64_t h_inv(uint64_t a, uint64_t mod) {
 }
 
 // ===================== Device constants =====================
-__constant__ uint64_t d_q[3];
-__constant__ uint64_t d_V_q[3][16][16];    // V[ell][r]
-__constant__ uint64_t d_Vinv_q[3][16][16];  // Vinv[r][ell]
+__constant__ uint64_t d_q[RNS_NUM_LIMBS];
+static cuDoubleComplex* d_wdft_inv = nullptr; // [eval_w][coeff_w]
+static bool wdft_inited = false;
 
-// ===================== Kernels (Revised for Poly-Major Layout) =====================
+// ===================== Kernels =====================
 
 /**
- * Packing Kernel: W-Inverse Transform + Transpose
- * * Input Layout:  [Batch=16][Limb=3][Space=N^2] (Linear chunks from SingleEncoder)
- * Output Layout: [Y=n][Limb=3][Pack(X, W)]   (Poly-Major for HE.cu)
- * * Mapping:
- * - idx covers Space (y, x). idx = y * n + x.
- * - r covers W-dim (0..15).
- * - Output Index = y * (3 * RLWE_N) + limb * RLWE_N + (x * 16 + r)
- * Assuming RLWE_N = n * 16 (e.g. 256 * 16 = 4096).
+ * Copy Kernel: W-batched CRT Layout (no W transform)
+ * Input/Output Layout: [Batch=phi][Limb][Space=N^2]
  */
-__global__ void pack_w_phi16_kernel(
+__global__ void copy_w_crt_kernel(
     const uint64_t* __restrict__ in_re,
     const uint64_t* __restrict__ in_im,
     uint64_t* __restrict__ out_re,
     uint64_t* __restrict__ out_im,
-    int n,      // Matrix dimension (e.g., 256)
-    int n2      // n * n
+    size_t total_words
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n2) return;
-
-    // Decode spatial indices (y, x) from idx
-    int y = idx / n;
-    int x = idx % n;
-    
-    // Poly-Major Stride Calculation
-    // Total coefficients per limb per polynomial = n * 16
-    int rlwe_n = n * 16; 
-    
-    // Size of one full polynomial block (all limbs)
-    int single_poly_size = 3 * rlwe_n;
-
-    #pragma unroll
-    for (int limb = 0; limb < 3; ++limb) {
-        const uint64_t Q = d_q[limb];
-
-        uint64_t v_re[16];
-        uint64_t v_im[16];
-
-        // Gather from input: [Batch][Limb][Space]
-        #pragma unroll
-        for (int ell = 0; ell < 16; ++ell) {
-            size_t off = (size_t)ell * (size_t)3 * (size_t)n2 + (size_t)limb * (size_t)n2 + (size_t)idx;
-            v_re[ell] = in_re[off];
-            v_im[ell] = in_im[off];
-        }
-
-        // W-Inverse Transform: c_r = sum_ell Vinv[r][ell] * v_ell
-        #pragma unroll
-        for (int r = 0; r < 16; ++r) {
-            uint64_t acc_re = 0;
-            uint64_t acc_im = 0;
-
-            #pragma unroll
-            for (int ell = 0; ell < 16; ++ell) {
-                uint64_t w = d_Vinv_q[limb][r][ell];
-                uint64_t t_re = d_mul_mod_u128(v_re[ell], w, Q);
-                uint64_t t_im = d_mul_mod_u128(v_im[ell], w, Q);
-                acc_re = d_add_mod(acc_re, t_re, Q);
-                acc_im = d_add_mod(acc_im, t_im, Q);
-            }
-
-            // Scatter to output: [Y][Limb][X_W_Packed]
-            // We pack W (r) into the fine-grained dimension of X
-            int packed_offset_in_poly = x * 16 + r;
-            
-            size_t out_off = (size_t)y * single_poly_size + 
-                             (size_t)limb * rlwe_n + 
-                             (size_t)packed_offset_in_poly;
-
-            out_re[out_off] = acc_re;
-            out_im[out_off] = acc_im;
-        }
-    }
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_words) return;
+    out_re[idx] = in_re[idx];
+    out_im[idx] = in_im[idx];
 }
 
-/**
- * Evaluation Kernel: W-Transform + Transpose Back
- * * Input Layout:  [Y][Limb][Pack(X, W)]
- * Output Layout: [Batch][Limb][Space]
- */
-__global__ void eval_w_phi16_kernel(
-    const uint64_t* __restrict__ in_re,
-    const uint64_t* __restrict__ in_im,
-    uint64_t* __restrict__ out_re,
-    uint64_t* __restrict__ out_im,
-    int n,
-    int n2
+// Layout convert: poly-major [poly=w*n+y][limb][x] -> matrix-major [w][limb][y][x]
+__global__ void poly_to_matrix_layout_kernel(
+    const uint64_t* __restrict__ in_poly,
+    uint64_t* __restrict__ out_mat,
+    int n, int limbs, int phi
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n2) return;
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t n2 = (size_t)n * (size_t)n;
+    size_t total = (size_t)phi * (size_t)limbs * n2;
+    if (idx >= total) return;
 
-    int y = idx / n;
-    int x = idx % n;
-    int rlwe_n = n * 16;
-    int single_poly_size = 3 * rlwe_n;
+    int x = (int)(idx % (size_t)n);
+    size_t t = idx / (size_t)n;
+    int y = (int)(t % (size_t)n);
+    int limb = (int)((t / (size_t)n) % (size_t)limbs);
+    int w = (int)(t / ((size_t)n * (size_t)limbs));
 
-    #pragma unroll
-    for (int limb = 0; limb < 3; ++limb) {
-        const uint64_t Q = d_q[limb];
+    int poly = w * n + y;
+    size_t in_off = ((size_t)poly * (size_t)limbs + (size_t)limb) * (size_t)n + (size_t)x;
+    out_mat[idx] = in_poly[in_off];
+}
 
-        uint64_t c_re[16];
-        uint64_t c_im[16];
-
-        // Gather from Poly-Major Input
-        #pragma unroll
-        for (int r = 0; r < 16; ++r) {
-            int packed_offset_in_poly = x * 16 + r;
-            size_t in_off = (size_t)y * single_poly_size + 
-                            (size_t)limb * rlwe_n + 
-                            (size_t)packed_offset_in_poly;
-            
-            c_re[r] = in_re[in_off];
-            c_im[r] = in_im[in_off];
-        }
-
-        // W-Transform: v_ell = sum_r V[ell][r] * c_r
-        #pragma unroll
-        for (int ell = 0; ell < 16; ++ell) {
-            uint64_t acc_re = 0;
-            uint64_t acc_im = 0;
-
-            #pragma unroll
-            for (int r = 0; r < 16; ++r) {
-                uint64_t w = d_V_q[limb][ell][r];
-                uint64_t t_re = d_mul_mod_u128(c_re[r], w, Q);
-                uint64_t t_im = d_mul_mod_u128(c_im[r], w, Q);
-                acc_re = d_add_mod(acc_re, t_re, Q);
-                acc_im = d_add_mod(acc_im, t_im, Q);
-            }
-
-            // Scatter to Output: [Batch][Limb][Space]
-            size_t out_off = (size_t)ell * (size_t)3 * (size_t)n2 + (size_t)limb * (size_t)n2 + (size_t)idx;
-            out_re[out_off] = acc_re;
-            out_im[out_off] = acc_im;
-        }
+__global__ void w_idft_kernel(
+    const cuDoubleComplex* __restrict__ in_eval_xy, // [eval_w][n2]
+    cuDoubleComplex* __restrict__ out_coeff_xy,     // [coeff_w][n2]
+    const cuDoubleComplex* __restrict__ inv_mat,    // [eval_w][coeff_w]
+    int n2,
+    int phi
+) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = (size_t)phi * (size_t)n2;
+    if (idx >= total) return;
+    int pos = (int)(idx % (size_t)n2);
+    int r = (int)(idx / (size_t)n2);
+    cuDoubleComplex acc = make_cuDoubleComplex(0.0, 0.0);
+    for (int w = 0; w < phi; ++w) {
+        cuDoubleComplex a = in_eval_xy[(size_t)w * (size_t)n2 + (size_t)pos];
+        cuDoubleComplex v = inv_mat[(size_t)w * (size_t)phi + (size_t)r];
+        acc = cuCadd(acc, cuCmul(a, v));
     }
+    out_coeff_xy[idx] = acc;
+}
+
+__global__ void quantize_coeff_to_rns_kernel(
+    const cuDoubleComplex* __restrict__ in_coeff_xy, // [coeff_w][n2]
+    uint64_t* __restrict__ out_re_rns,               // [coeff_w][limb][n2]
+    uint64_t* __restrict__ out_im_rns,
+    int n2,
+    int limbs,
+    int phi,
+    double delta
+) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = (size_t)phi * (size_t)limbs * (size_t)n2;
+    if (idx >= total) return;
+    int pos = (int)(idx % (size_t)n2);
+    size_t t = idx / (size_t)n2;
+    int limb = (int)(t % (size_t)limbs);
+    int r = (int)(t / (size_t)limbs);
+
+    cuDoubleComplex z = in_coeff_xy[(size_t)r * (size_t)n2 + (size_t)pos];
+    int64_t xr = llround(cuCreal(z) * delta);
+    int64_t xi = llround(cuCimag(z) * delta);
+    uint64_t q = d_q[limb];
+    int64_t mr = xr % (int64_t)q;
+    int64_t mi = xi % (int64_t)q;
+    if (mr < 0) mr += (int64_t)q;
+    if (mi < 0) mi += (int64_t)q;
+    out_re_rns[idx] = (uint64_t)mr;
+    out_im_rns[idx] = (uint64_t)mi;
 }
 
 // ===================== Class Implementation =====================
@@ -206,42 +158,73 @@ BatchedEncoder::BatchedEncoder(int n)
     init_tables_p17();
 }
 
-void BatchedEncoder::encode_packed_p17(
+void BatchedEncoder::encode_to_wntt_eval(
     const cuDoubleComplex* d_msg_batch,
     uint64_t* d_out_re,
     uint64_t* d_out_im,
     cudaStream_t stream
 ) {
-    // 16 batches, each is [3 limbs][n*n coeffs]
-    const size_t blk_words = (size_t)3 * (size_t)n2_;
-    const size_t tmp_words = (size_t)16 * blk_words;
+    const int phi = BATCH_SIZE;
+    const int limbs = RNS_NUM_LIMBS;
+    const size_t n2 = (size_t)n2_;
+    const size_t coeff_words = (size_t)phi * (size_t)limbs * n2;
 
-    uint64_t* d_tmp_re = nullptr;
-    uint64_t* d_tmp_im = nullptr;
-    cudaMalloc(&d_tmp_re, tmp_words * sizeof(uint64_t));
-    cudaMalloc(&d_tmp_im, tmp_words * sizeof(uint64_t));
+    cuDoubleComplex* d_xy_coeff = nullptr;     // [phi][n2] after XY-IDFT
+    cuDoubleComplex* d_w_coeff = nullptr;      // [phi][n2] after W-IDFT
+    uint64_t* d_coeff_re = nullptr;            // [phi][limb][n2] W-coeff RNS
+    uint64_t* d_coeff_im = nullptr;
+    uint64_t* d_eval_re = nullptr;             // poly-major [poly][limb][x]
+    uint64_t* d_eval_im = nullptr;
+    uint64_t* d_eval_re_mat = nullptr;         // matrix-major [w][limb][y][x]
+    uint64_t* d_eval_im_mat = nullptr;
+    cudaMalloc(&d_xy_coeff, (size_t)phi * n2 * sizeof(cuDoubleComplex));
+    cudaMalloc(&d_w_coeff, (size_t)phi * n2 * sizeof(cuDoubleComplex));
+    cudaMalloc(&d_coeff_re, coeff_words * sizeof(uint64_t));
+    cudaMalloc(&d_coeff_im, coeff_words * sizeof(uint64_t));
+    cudaMalloc(&d_eval_re, coeff_words * sizeof(uint64_t));
+    cudaMalloc(&d_eval_im, coeff_words * sizeof(uint64_t));
+    cudaMalloc(&d_eval_re_mat, coeff_words * sizeof(uint64_t));
+    cudaMalloc(&d_eval_im_mat, coeff_words * sizeof(uint64_t));
 
     Encoder encoder(n_);
 
-    // 1. Encode each matrix in the batch (Single Encoder)
-    // d_tmp Layout: [Batch][Limb][Space]
-    for (int ell = 0; ell < 16; ++ell) {
+    // 1) XY-IDFT only (no scale/RNS yet)
+    for (int ell = 0; ell < phi; ++ell) {
         const cuDoubleComplex* d_m_ell = d_msg_batch + (size_t)ell * (size_t)n2_;
-        uint64_t* d_re_ell = d_tmp_re + (size_t)ell * blk_words;
-        uint64_t* d_im_ell = d_tmp_im + (size_t)ell * blk_words;
-        encoder.encode(d_m_ell, d_re_ell, d_im_ell);
+        cuDoubleComplex* d_c_ell = d_xy_coeff + (size_t)ell * n2;
+        encoder.idft2(d_m_ell, d_c_ell);
     }
 
-    // 2. Pack and Transpose to Poly-Major
+    // 2) W-IDFT in complex domain (eval -> coeff)
     int threads = 256;
-    int blocks  = (n2_ + threads - 1) / threads;
-
-    pack_w_phi16_kernel<<<blocks, threads, 0, stream>>>(
-        d_tmp_re, d_tmp_im, d_out_re, d_out_im, n_, n2_
+    int blocks  = (int)(((size_t)phi * n2 + threads - 1) / threads);
+    w_idft_kernel<<<blocks, threads, 0, stream>>>(
+        d_xy_coeff, d_w_coeff, d_wdft_inv, (int)n2, phi
     );
 
-    cudaFree(d_tmp_re);
-    cudaFree(d_tmp_im);
+    // 3) scale+round then RNS split in W-coeff domain
+    blocks = (int)((coeff_words + threads - 1) / threads);
+    quantize_coeff_to_rns_kernel<<<blocks, threads, 0, stream>>>(
+        d_w_coeff, d_coeff_re, d_coeff_im, (int)n2, limbs, phi, SCALING_FACTOR
+    );
+
+    // 4) explicit W-NTT to output eval layout
+    wntt_forward_matrix(d_coeff_re, d_eval_re, n_, limbs, phi, stream);
+    wntt_forward_matrix(d_coeff_im, d_eval_im, n_, limbs, phi, stream);
+    blocks = (int)((coeff_words + threads - 1) / threads);
+    poly_to_matrix_layout_kernel<<<blocks, threads, 0, stream>>>(d_eval_re, d_eval_re_mat, n_, limbs, phi);
+    poly_to_matrix_layout_kernel<<<blocks, threads, 0, stream>>>(d_eval_im, d_eval_im_mat, n_, limbs, phi);
+    cudaMemcpyAsync(d_out_re, d_eval_re_mat, coeff_words * sizeof(uint64_t), cudaMemcpyDeviceToDevice, stream);
+    cudaMemcpyAsync(d_out_im, d_eval_im_mat, coeff_words * sizeof(uint64_t), cudaMemcpyDeviceToDevice, stream);
+
+    cudaFree(d_xy_coeff);
+    cudaFree(d_w_coeff);
+    cudaFree(d_coeff_re);
+    cudaFree(d_coeff_im);
+    cudaFree(d_eval_re);
+    cudaFree(d_eval_im);
+    cudaFree(d_eval_re_mat);
+    cudaFree(d_eval_im_mat);
 }
 
 void BatchedEncoder::unpack_eval_p17(
@@ -251,11 +234,11 @@ void BatchedEncoder::unpack_eval_p17(
     uint64_t* d_eval_im,
     cudaStream_t stream
 ) {
+    const size_t total_words = (size_t)BATCH_SIZE * (size_t)RNS_NUM_LIMBS * (size_t)n2_;
     int threads = 256;
-    int blocks  = (n2_ + threads - 1) / threads;
-
-    eval_w_phi16_kernel<<<blocks, threads, 0, stream>>>(
-        d_in_re, d_in_im, d_eval_re, d_eval_im, n_, n2_
+    int blocks  = (int)((total_words + threads - 1) / threads);
+    copy_w_crt_kernel<<<blocks, threads, 0, stream>>>(
+        d_in_re, d_in_im, d_eval_re, d_eval_im, total_words
     );
 }
 
@@ -264,103 +247,95 @@ void BatchedEncoder::unpack_eval_p17(
 void gpu_pack_w_phi16(const uint64_t* in_re, const uint64_t* in_im, 
                       uint64_t* out_re, uint64_t* out_im, 
                       int n2, cudaStream_t stream) {
-    // Assuming n2 passed from HE.cu is total coefficients?
-    // Actually, for consistency, let's derive n_ from MATRIX_N logic or assume n2 is n*n
-    // If n2 == 65536 (256*256), then n = 256.
-    int n = (int)sqrt((double)n2); 
-    
+    const size_t total_words = (size_t)BATCH_SIZE * (size_t)RNS_NUM_LIMBS * (size_t)n2;
     int threads = 256;
-    int blocks = (n2 + threads - 1) / threads;
-    pack_w_phi16_kernel<<<blocks, threads, 0, stream>>>(in_re, in_im, out_re, out_im, n, n2);
+    int blocks = (int)((total_words + threads - 1) / threads);
+    copy_w_crt_kernel<<<blocks, threads, 0, stream>>>(
+        in_re, in_im, out_re, out_im, total_words
+    );
 }
 
 void gpu_eval_w_phi16(const uint64_t* in_re, const uint64_t* in_im, 
                       uint64_t* out_re, uint64_t* out_im, 
                       int n2, cudaStream_t stream) {
-    int n = (int)sqrt((double)n2); 
+    const size_t total_words = (size_t)BATCH_SIZE * (size_t)RNS_NUM_LIMBS * (size_t)n2;
     int threads = 256;
-    int blocks = (n2 + threads - 1) / threads;
-    eval_w_phi16_kernel<<<blocks, threads, 0, stream>>>(in_re, in_im, out_re, out_im, n, n2);
+    int blocks = (int)((total_words + threads - 1) / threads);
+    copy_w_crt_kernel<<<blocks, threads, 0, stream>>>(
+        in_re, in_im, out_re, out_im, total_words
+    );
 }
 
 void BatchedEncoder::init_tables_p17() {
-    uint64_t moduli[3] = {
-        140737488252929ULL,
-        140737488218113ULL,
-        140737488061441ULL 
-    };
+    cudaMemcpyToSymbol(d_q, RNS_MODULI, sizeof(RNS_MODULI));
+    if (wdft_inited) return;
+    const int phi = BATCH_SIZE;
+    const double p = (double)BATCH_PRIME_P;
+    const double two_pi = 6.283185307179586476925286766559;
 
-    cudaMemcpyToSymbol(d_q, moduli, sizeof(moduli));
-
-    uint64_t V_host[3][16][16]    = {};
-    uint64_t Vinv_host[3][16][16] = {};
-
-    for (int limb = 0; limb < 3; ++limb) {
-        uint64_t q = moduli[limb];
-
-        // Find primitive 17th root omega
-        uint64_t omega = 0;
-        uint64_t e = (q - 1) / 17;
-        const uint64_t MAX_TRIES = 2000;
-        for (uint64_t a = 2; a < 2 + MAX_TRIES; ++a) {
-            uint64_t cand = h_pow(a, e, q);
-            if (cand == 1) continue;
-            if (h_pow(cand, 17, q) != 1) continue;
-            omega = cand;
-            break;
+    std::vector<uint16_t> exp(phi);
+    int idx = 0;
+    for (int a = 1; a <= 2; ++a) {
+        for (int b = 1; b <= 256; ++b) {
+            exp[idx++] = (uint16_t)((a * 257 + b * 3) % BATCH_PRIME_P);
         }
-
-        if (omega == 0) throw std::runtime_error("Failed to find primitive 17th root.");
-
-        uint64_t eta[16];
-        for (int ell = 0; ell < 16; ++ell) {
-            eta[ell] = h_pow(omega, (uint64_t)(ell + 1), q);
-        }
-
-        // V[ell][r] = eta_ell^r
-        for (int ell = 0; ell < 16; ++ell) {
-            uint64_t pwr = 1;
-            for (int r = 0; r < 16; ++r) {
-                V_host[limb][ell][r] = pwr;
-                pwr = h_mul_u128(pwr, eta[ell], q);
-            }
-        }
-
-        // Invert V via Gauss-Jordan
-        uint64_t A[16][32];
-        for (int i = 0; i < 16; ++i) {
-            for (int j = 0; j < 16; ++j) A[i][j] = V_host[limb][i][j];
-            for (int j = 0; j < 16; ++j) A[i][16 + j] = (i == j) ? 1 : 0;
-        }
-
-        for (int col = 0; col < 16; ++col) {
-            int piv = col;
-            while (piv < 16 && A[piv][col] == 0) piv++;
-            if (piv == 16) throw std::runtime_error("V not invertible.");
-            if (piv != col) {
-                for (int j = 0; j < 32; ++j) std::swap(A[piv][j], A[col][j]);
-            }
-            uint64_t inv_p = h_inv(A[col][col], q);
-            for (int j = 0; j < 32; ++j) A[col][j] = h_mul_u128(A[col][j], inv_p, q);
-            for (int row = 0; row < 16; ++row) {
-                if (row == col) continue;
-                uint64_t f = A[row][col];
-                if (f == 0) continue;
-                for (int j = 0; j < 32; ++j) {
-                    uint64_t t = h_mul_u128(f, A[col][j], q);
-                    A[row][j] = h_sub(A[row][j], t, q);
-                }
-            }
-        }
-
-        // Extract Vinv
-        for (int r = 0; r < 16; ++r)
-            for (int ell = 0; ell < 16; ++ell)
-                Vinv_host[limb][r][ell] = A[r][16 + ell]; // Note: A stores [I | Vinv]
     }
 
-    cudaMemcpyToSymbol(d_V_q, V_host, sizeof(V_host));
-    cudaMemcpyToSymbol(d_Vinv_q, Vinv_host, sizeof(Vinv_host));
+    std::vector<std::complex<double>> v((size_t)phi * (size_t)phi);
+    for (int w = 0; w < phi; ++w) {
+        double ang = two_pi * (double)exp[w] / p;
+        std::complex<double> root(std::cos(ang), std::sin(ang));
+        std::complex<double> cur(1.0, 0.0);
+        for (int r = 0; r < phi; ++r) {
+            v[(size_t)w * (size_t)phi + (size_t)r] = cur;
+            cur *= root;
+        }
+    }
+    // Gauss-Jordan inverse in complex
+    std::vector<std::complex<double>> a = v;
+    std::vector<std::complex<double>> inv((size_t)phi * (size_t)phi, std::complex<double>(0.0, 0.0));
+    for (int i = 0; i < phi; ++i) inv[(size_t)i * (size_t)phi + (size_t)i] = {1.0, 0.0};
+    for (int i = 0; i < phi; ++i) {
+        int pivot = i;
+        double best = std::abs(a[(size_t)i * (size_t)phi + (size_t)i]);
+        for (int r = i + 1; r < phi; ++r) {
+            double cand = std::abs(a[(size_t)r * (size_t)phi + (size_t)i]);
+            if (cand > best) { best = cand; pivot = r; }
+        }
+        if (best < 1e-18) throw std::runtime_error("W-IDFT matrix singular");
+        if (pivot != i) {
+            for (int c = 0; c < phi; ++c) {
+                std::swap(a[(size_t)i * (size_t)phi + (size_t)c], a[(size_t)pivot * (size_t)phi + (size_t)c]);
+                std::swap(inv[(size_t)i * (size_t)phi + (size_t)c], inv[(size_t)pivot * (size_t)phi + (size_t)c]);
+            }
+        }
+        std::complex<double> pv = a[(size_t)i * (size_t)phi + (size_t)i];
+        for (int c = 0; c < phi; ++c) {
+            a[(size_t)i * (size_t)phi + (size_t)c] /= pv;
+            inv[(size_t)i * (size_t)phi + (size_t)c] /= pv;
+        }
+        for (int r = 0; r < phi; ++r) {
+            if (r == i) continue;
+            std::complex<double> f = a[(size_t)r * (size_t)phi + (size_t)i];
+            if (std::abs(f) < 1e-18) continue;
+            for (int c = 0; c < phi; ++c) {
+                a[(size_t)r * (size_t)phi + (size_t)c] -= f * a[(size_t)i * (size_t)phi + (size_t)c];
+                inv[(size_t)r * (size_t)phi + (size_t)c] -= f * inv[(size_t)i * (size_t)phi + (size_t)c];
+            }
+        }
+    }
+
+    std::vector<cuDoubleComplex> h_inv((size_t)phi * (size_t)phi);
+    for (int w = 0; w < phi; ++w) {
+        for (int r = 0; r < phi; ++r) {
+            // Kernel reads inv_mat[w][r], so store V^{-1}[r][w] at [w][r].
+            const auto& z = inv[(size_t)r * (size_t)phi + (size_t)w];
+            h_inv[(size_t)w * (size_t)phi + (size_t)r] = make_cuDoubleComplex(z.real(), z.imag());
+        }
+    }
+    cudaMalloc(&d_wdft_inv, h_inv.size() * sizeof(cuDoubleComplex));
+    cudaMemcpy(d_wdft_inv, h_inv.data(), h_inv.size() * sizeof(cuDoubleComplex), cudaMemcpyHostToDevice);
+    wdft_inited = true;
 }
 
 } // namespace matrix_fhe
