@@ -3,6 +3,7 @@
 #include "../include/core/config.h"
 #include "../include/core/encoder.cuh"
 #include "../include/core/batched_encoder.cuh"
+#include "../include/core/HE.cuh"
 
 #include <cuda_runtime.h>
 #include <cuComplex.h>
@@ -60,21 +61,29 @@ int main() {
     batched_enc.encode_to_wntt_eval(d_in, d_packed_re, d_packed_im);
     cuda_sync("encode");
 
-    // Decode each ell
+    // Decode through the same packed W-NTT -> (W-INTT + compose/scale + W-DFT + XY-DFT) path.
     cuDoubleComplex* d_out = nullptr;
     cuda_check(cudaMalloc(&d_out, h_in.size() * sizeof(cuDoubleComplex)), "malloc out");
 
-    Encoder single_enc(n);
-    size_t batch_rns_stride = (size_t)LIMBS * (size_t)n2;
-    size_t batch_complex_stride = (size_t)n2;
+    RLWECiphertext ct_re, ct_im;
+    allocate_ciphertext(ct_re, LIMBS);
+    allocate_ciphertext(ct_im, LIMBS);
+    size_t total_coeffs = packed_words;
+    uint64_t* ct_re_b = ct_re.data;
+    uint64_t* ct_re_a = ct_re.data + total_coeffs;
+    uint64_t* ct_im_b = ct_im.data;
+    uint64_t* ct_im_a = ct_im.data + total_coeffs;
+    cuda_check(cudaMemcpy(ct_re_b, d_packed_re, total_coeffs * sizeof(uint64_t), cudaMemcpyDeviceToDevice), "copy packed re->ct b");
+    cuda_check(cudaMemcpy(ct_im_b, d_packed_im, total_coeffs * sizeof(uint64_t), cudaMemcpyDeviceToDevice), "copy packed im->ct b");
+    cuda_check(cudaMemset(ct_re_a, 0, total_coeffs * sizeof(uint64_t)), "zero ct re a");
+    cuda_check(cudaMemset(ct_im_a, 0, total_coeffs * sizeof(uint64_t)), "zero ct im a");
 
-    for (int ell = 0; ell < PHI; ++ell) {
-        single_enc.decode_lane_from_rns_eval(
-            d_packed_re + (size_t)ell * batch_rns_stride,
-            d_packed_im + (size_t)ell * batch_rns_stride,
-            d_out      + (size_t)ell * batch_complex_stride
-        );
-    }
+    SecretKey sk_zero{};
+    sk_zero.num_limbs = LIMBS;
+    cuda_check(cudaMalloc(&sk_zero.data, (size_t)PHI * (size_t)LIMBS * (size_t)n * sizeof(uint64_t)), "malloc zero sk");
+    cuda_check(cudaMemset(sk_zero.data, 0, (size_t)PHI * (size_t)LIMBS * (size_t)n * sizeof(uint64_t)), "zero sk");
+
+    decrypt_and_decode(ct_re, ct_im, sk_zero, d_out);
     cuda_sync("decode");
 
     // Verify
@@ -99,6 +108,9 @@ int main() {
     cudaFree(d_out);
     cudaFree(d_packed_re);
     cudaFree(d_packed_im);
+    free_ciphertext(ct_re);
+    free_ciphertext(ct_im);
+    cudaFree(sk_zero.data);
 
     return (max_err < 1e-3) ? 0 : 1;
 }

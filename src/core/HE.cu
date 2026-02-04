@@ -1616,48 +1616,36 @@ void decrypt_to_eval_matrix(const RLWECiphertext& ct, const SecretKey& sk, uint6
     cudaFree(d_eval_poly);
 }
 
-void decrypt_and_decode(const RLWECiphertext& ct_re, const RLWECiphertext& ct_im,
-                        const SecretKey& sk, cuDoubleComplex* output_msg) {
+static void decode_eval_pair_to_complex(
+    const uint64_t* d_eval_re,
+    const uint64_t* d_eval_im,
+    int limbs,
+    cuDoubleComplex* output_msg
+) {
     const int n = MATRIX_N;
-    const int limbs = ct_re.num_limbs;
     const int phi = BATCH_SIZE;
-    size_t total_coeffs = (size_t)phi * (size_t)n * (size_t)limbs * (size_t)n;
+    const size_t total_coeffs = (size_t)phi * (size_t)n * (size_t)limbs * (size_t)n;
+    const size_t nn = (size_t)n * (size_t)n;
+    const int threads = 256;
+    const size_t lane_stride = (size_t)limbs * nn;
+    const size_t out_stride = nn;
 
-    uint64_t* d_eval_re = nullptr;
-    uint64_t* d_eval_im = nullptr;
     uint64_t* d_coeff_re = nullptr;
     uint64_t* d_coeff_im = nullptr;
     uint64_t* d_comp_re_mag = nullptr;
     uint64_t* d_comp_im_mag = nullptr;
     uint8_t* d_comp_re_neg = nullptr;
     uint8_t* d_comp_im_neg = nullptr;
-    int64_t* d_comp_re = nullptr;
-    int64_t* d_comp_im = nullptr;
     cuDoubleComplex* d_coeff_cx = nullptr;
     cuDoubleComplex* d_eval_cx = nullptr;
-    cudaMalloc(&d_eval_re, total_coeffs * sizeof(uint64_t));
-    cudaMalloc(&d_eval_im, total_coeffs * sizeof(uint64_t));
     cudaMalloc(&d_coeff_re, total_coeffs * sizeof(uint64_t));
     cudaMalloc(&d_coeff_im, total_coeffs * sizeof(uint64_t));
-    cudaMalloc(&d_comp_re_mag, (size_t)phi * (size_t)n * (size_t)n * (size_t)HE_CRT_BIGINT_LIMBS * sizeof(uint64_t));
-    cudaMalloc(&d_comp_im_mag, (size_t)phi * (size_t)n * (size_t)n * (size_t)HE_CRT_BIGINT_LIMBS * sizeof(uint64_t));
-    cudaMalloc(&d_comp_re_neg, (size_t)phi * (size_t)n * (size_t)n * sizeof(uint8_t));
-    cudaMalloc(&d_comp_im_neg, (size_t)phi * (size_t)n * (size_t)n * sizeof(uint8_t));
-    cudaMalloc(&d_comp_re, (size_t)phi * (size_t)n * (size_t)n * sizeof(int64_t));
-    cudaMalloc(&d_comp_im, (size_t)phi * (size_t)n * (size_t)n * sizeof(int64_t));
-    cudaMalloc(&d_coeff_cx, (size_t)phi * (size_t)n * (size_t)n * sizeof(cuDoubleComplex));
-    cudaMalloc(&d_eval_cx, (size_t)phi * (size_t)n * (size_t)n * sizeof(cuDoubleComplex));
-
-    // decrypt_to_eval outputs poly-major [poly=w*n+y][limb][x], matching wntt_inverse_matrix input.
-    decrypt_to_eval(ct_re, sk, d_eval_re);
-    decrypt_to_eval(ct_im, sk, d_eval_im);
-
-    const size_t nn = (size_t)n * (size_t)n;
-    const int threads = 256;
-    const int blocks = (int)((nn + threads - 1) / threads);
-    const size_t lane_stride = (size_t)limbs * nn;
-    const size_t out_stride = nn;
-    Encoder decoder(n);
+    cudaMalloc(&d_comp_re_mag, (size_t)phi * nn * (size_t)HE_CRT_BIGINT_LIMBS * sizeof(uint64_t));
+    cudaMalloc(&d_comp_im_mag, (size_t)phi * nn * (size_t)HE_CRT_BIGINT_LIMBS * sizeof(uint64_t));
+    cudaMalloc(&d_comp_re_neg, (size_t)phi * nn * sizeof(uint8_t));
+    cudaMalloc(&d_comp_im_neg, (size_t)phi * nn * sizeof(uint8_t));
+    cudaMalloc(&d_coeff_cx, (size_t)phi * nn * sizeof(cuDoubleComplex));
+    cudaMalloc(&d_eval_cx, (size_t)phi * nn * sizeof(cuDoubleComplex));
 
     wntt_inverse_matrix(d_eval_re, d_coeff_re, n, limbs, phi, 0);
     wntt_inverse_matrix(d_eval_im, d_coeff_im, n, limbs, phi, 0);
@@ -1684,23 +1672,39 @@ void decrypt_and_decode(const RLWECiphertext& ct_re, const RLWECiphertext& ct_im
         d_comp_re_mag, d_comp_re_neg, d_comp_im_mag, d_comp_im_neg, d_coeff_cx, total_centered, SCALING_FACTOR);
     wdft_forward_complex(d_coeff_cx, d_eval_cx, n, phi, 0);
 
+    Encoder decoder(n);
     for (int ell = 0; ell < phi; ++ell) {
         const cuDoubleComplex* lane_eval = d_eval_cx + (size_t)ell * nn;
         decoder.decode_from_eval_complex(lane_eval, output_msg + (size_t)ell * out_stride);
     }
 
-    cudaFree(d_eval_re);
-    cudaFree(d_eval_im);
     cudaFree(d_coeff_re);
     cudaFree(d_coeff_im);
     cudaFree(d_comp_re_mag);
     cudaFree(d_comp_im_mag);
     cudaFree(d_comp_re_neg);
     cudaFree(d_comp_im_neg);
-    cudaFree(d_comp_re);
-    cudaFree(d_comp_im);
     cudaFree(d_coeff_cx);
     cudaFree(d_eval_cx);
+}
+
+void decrypt_and_decode(const RLWECiphertext& ct_re, const RLWECiphertext& ct_im,
+                        const SecretKey& sk, cuDoubleComplex* output_msg) {
+    const int limbs = ct_re.num_limbs;
+    const int phi = BATCH_SIZE;
+    const int n = MATRIX_N;
+    size_t total_coeffs = (size_t)phi * (size_t)n * (size_t)limbs * (size_t)n;
+    uint64_t* d_eval_re = nullptr;
+    uint64_t* d_eval_im = nullptr;
+    cudaMalloc(&d_eval_re, total_coeffs * sizeof(uint64_t));
+    cudaMalloc(&d_eval_im, total_coeffs * sizeof(uint64_t));
+
+    decrypt_to_eval(ct_re, sk, d_eval_re);
+    decrypt_to_eval(ct_im, sk, d_eval_im);
+    decode_eval_pair_to_complex(d_eval_re, d_eval_im, limbs, output_msg);
+
+    cudaFree(d_eval_re);
+    cudaFree(d_eval_im);
 }
 
 void add_ciphertexts(const RLWECiphertext& ct1, const RLWECiphertext& ct2, RLWECiphertext& res) {

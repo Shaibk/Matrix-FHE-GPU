@@ -157,18 +157,4 @@ target_include_directories(test_wcrt_roundtrip PRIVATE
 
 target_link_libraries(test_wcrt_roundtrip PRIVATE m)
 
-add_executable(test_decrypt_to_eval_compare
-    test/test_decrypt_to_eval_compare.cu
-    ${MY_SRC_CORE_FILES}
-    ${PHANTOM_SOURCES}
-)
-
-target_include_directories(test_decrypt_to_eval_compare PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${PHANTOM_HOME}/include
-    ${PHANTOM_HOME}/src
-)
-
-target_link_libraries(test_decrypt_to_eval_compare PRIVATE m)
-
 message(STATUS "Configured matrix-fhe-gpu with FULL Phantom sources.")
